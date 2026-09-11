@@ -2134,12 +2134,17 @@ class SocialStatePlugin(MaiBotPlugin):
 
     # 正则要点（官方陷阱清单 §13-7）：宿主用 re.search 匹配，回复场景下命令不在文本开头，
     # `^` 锚点会失配 → 用 (?<!\S) 负向前瞻（命令前必须是行首或空白）代替 ^。
-    @Command("关系", description="查看关系状态：/关系 或 /关系 <QQ号|昵称>", pattern=r"(?<!\S)/关系(?:\s+(?P<target>.+?))?\s*$")
+    @Command("关系", description="查看关系状态：/关系（群内为隐私模式）或 /关系 <QQ号|昵称>（群内仅本人/操作员）", pattern=r"(?<!\S)/关系(?:\s+(?P<target>.+?))?\s*$")
     async def cmd_relation(self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any):
         try:
             groups = matched_groups or {}
             target = str(groups.get("target") or "").strip()
-            text = self._render_query(stream_id, target)
+            sender_uid = str(kwargs.get("user_id") or "").strip()
+            sender_platform = str(kwargs.get("platform") or "qq")
+            in_group = bool(str(kwargs.get("group_id") or "").strip())
+            is_operator = bool(kwargs.get("is_local_operator"))
+            text = self._render_query(stream_id, target, sender_uid=sender_uid,
+                                      sender_platform=sender_platform, in_group=in_group, is_operator=is_operator)
         except Exception as exc:
             text = f"❌ 查询出错：{exc}"
         await self.ctx.send.text(text, stream_id)
@@ -2215,8 +2220,8 @@ class SocialStatePlugin(MaiBotPlugin):
             "给每个联系人记一本账：好感度 / 今日心情 / 被冷落指数 / 待续线头 / 互动时间。\n"
             "麦麦回复时会自动参考（对喜欢的人更热情，被冷落时更克制）。\n\n"
             "命令：\n"
-            "  /关系 —— 私聊查自己；群里看最近互动 top5\n"
-            "  /关系 <QQ号或昵称> —— 查指定的人\n"
+            "  /关系 —— 私聊查自己；群里看最近互动 top5（隐私模式：昵称+QQ尾号）\n"
+            "  /关系 <QQ号或昵称> —— 查指定的人（群内仅限本人或操作员）\n"
             "  /今天 —— 看麦麦今天的日程\n"
             "  /ss_set <QQ号> <字段> <值> —— 手动调账（仅操作员）\n"
             "     字段：affinity 好感(-100~100)｜mood 心情(-50~50)｜ignore 冷落(0~100)｜thread 线头\n"
@@ -2229,10 +2234,34 @@ class SocialStatePlugin(MaiBotPlugin):
         await self.ctx.send.text(text, stream_id)
         return True, "ok", True
 
-    def _render_query(self, stream_id: str, target: str) -> str:
+    def _render_query(self, stream_id: str, target: str, sender_uid: str = "",
+                      sender_platform: str = "qq", in_group: bool = False, is_operator: bool = False) -> str:
         store = self._store
         if store is None:
             return "⚠️ 插件未启用或存储未就绪"
+
+        if in_group:
+            # 群内隐私边界（v0.4.3 上架评审要求）：
+            # 1) top5 只显示昵称+QQ 尾号，不显示心情/冷落/线头；
+            # 2) 带目标查询仅限"查本人"或操作员——不向全群广播他人账本。
+            if target:
+                row = store.find_person(target)
+                if row is None:
+                    return f"没找到「{target}」——ta 还没和麦麦说过话，或昵称对不上（可用 QQ 号试试）"
+                sender_pid = get_person_id(sender_platform, sender_uid) if sender_uid else ""
+                is_self = bool(sender_pid) and str(row.get("person_id")) == sender_pid
+                if is_operator:
+                    return self._render_row(row)
+                if is_self:
+                    return self._render_row(row, group_self=True)
+                return "🔒 群里只能查自己的关系状态（/关系）；查别人的账本请让麦麦主人操作，或私聊麦麦。"
+            rows = store.top_persons(5)
+            if not rows:
+                return "还没有任何记录——先让麦麦跟人聊几句吧"
+            lines = ["💞 最近互动的关系状态（top5，隐私模式）："]
+            for row in rows:
+                lines.append(self._render_row(row, compact=True))
+            return "\n".join(lines)
 
         if target:
             row = store.find_person(target)
@@ -2246,16 +2275,23 @@ class SocialStatePlugin(MaiBotPlugin):
             if row is not None:
                 return self._render_row(row)
 
-        # 群里：最近互动 top5
+        # 群里：最近互动 top5（此分支理论上不再到达，保留兼容）
         rows = store.top_persons(5)
         if not rows:
             return "还没有任何记录——先让麦麦跟人聊几句吧"
-        lines = ["💞 最近互动的关系状态（top5）："]
+        lines = ["💞 最近互动的关系状态（top5，隐私模式）："]
         for row in rows:
             lines.append(self._render_row(row, compact=True))
         return "\n".join(lines)
 
-    def _render_row(self, row: Dict[str, Any], compact: bool = False) -> str:
+    @staticmethod
+    def _mask_uid(uid: str) -> str:
+        uid = str(uid or "")
+        if len(uid) <= 4:
+            return "···" + uid
+        return "···" + uid[-4:]
+
+    def _render_row(self, row: Dict[str, Any], compact: bool = False, group_self: bool = False) -> str:
         name = str(row.get("display_name") or "?")
         uid = str(row.get("user_id") or "")
         aff = float(row.get("affinity") or 0.0)
@@ -2267,20 +2303,22 @@ class SocialStatePlugin(MaiBotPlugin):
         total = int(row.get("msg_count_total") or 0)
 
         if compact:
-            line = f"• {name}" + (f"({uid})" if uid else "") + f"：好感 {aff:+.0f}（{affinity_label(aff)}）"
-            if abs(mood) >= 1:
-                line += f"｜心情 {mood:+.0f}"
-            if ign >= 1:
-                line += f"｜冷落 {ign:.0f}"
+            # 群内 top5 隐私模式：昵称 + QQ 尾号，不显示完整账号/心情/冷落/线头
+            line = f"• {name}" + (f"（···{self._mask_uid(uid)}）" if uid else "") + f"：好感 {aff:+.0f}（{affinity_label(aff)}）"
             if last_msg > 0:
                 line += f"｜发言 {fmt_duration(now - last_msg)}"
             return line
 
         lines = [
-            f"💞 {name}" + (f"（QQ {uid}）" if uid else ""),
+            f"💞 {name}" + (f"（QQ {self._mask_uid(uid) if group_self else uid}）" if uid else ""),
             f"好感：{aff:+.0f}/100（{affinity_label(aff)}）",
             f"心情偏移：{mood:+.0f}｜冷落：{ign:.0f}/100",
         ]
+        if group_self:
+            # 群内查本人：不显示线头（避免向全群广播），其余同完整版
+            if last_msg > 0:
+                lines.append(f"你最后发言：{fmt_duration(now - last_msg)}")
+            return "\n".join(lines)
         if last_msg > 0:
             lines.append(f"对方最后发言：{fmt_duration(now - last_msg)}")
         if last_reply > 0:
