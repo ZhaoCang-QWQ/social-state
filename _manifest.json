@@ -1,0 +1,46 @@
+{
+  "manifest_version": 2,
+  "version": "0.4.3",
+  "id": "github.ZhaoCang-QWQ.social-state",
+  "name": "关系状态表",
+  "description": "麦麦的社交地基：给每个联系人记一本账（好感、心情、冷落、带有效期的线头、关系边）。感知器用 LLM 语境化评估每轮互动自动打分并挖掘话题钩子；群聊自动回味批量更新印象、抽取冲突记关系边；每天生成麦麦自己的生活日程，回复前注入表达约束与关系温度。纯旁路观察，不改主程序行为。",
+  "author": {
+    "name": "昭沧QWQ",
+    "url": "https://github.com/ZhaoCang-QWQ"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/ZhaoCang-QWQ/social-state",
+    "homepage": "https://github.com/ZhaoCang-QWQ/social-state",
+    "documentation": "https://github.com/ZhaoCang-QWQ/social-state/blob/main/README.md",
+    "issues": "https://github.com/ZhaoCang-QWQ/social-state/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "llm.generate",
+    "maisaka.proactive.trigger"
+  ],
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "emoji",
+      "value": "💞"
+    }
+  },
+  "changelog": "CHANGELOG.md",
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
