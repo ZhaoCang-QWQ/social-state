@@ -16,8 +16,9 @@
     打分语境化：prompt 必须带当前好感/冷落 + 最近对话——同一句话在不同关系温度下分数相反
 
 生活日程（阶段3a）：
-    每天第一条消息触发懒生成当日日程（LLM 按人设排 4-6 个时段），存 daily_schedule 表；
-    回复前注入"现在这个点你大概在做 XX"；深夜自动进入"被窝"状态；/今天 命令查看全天。
+    每天按当前群或私聊懒生成当日日程（LLM 按人设排 4-6 个时段），存 daily_schedule
+    （scope：p 私聊 / g:群号，不串会话）；回复前注入"现在这个点你大概在做 XX"；
+    深夜自动进入"被窝"状态；/今天 查看当前会话的全天。展示名用 daily_life.bot_name（默认麦麦）。
 
 两个读出口：
     1. maisaka.replyer.before_request（BLOCKING）：回复前注入关系温度 + 临期线头 + 表达约束 + 今日日程
@@ -28,7 +29,7 @@
 命令：
     /关系            私聊=查自己；群里=最近互动 top5
     /关系 <QQ|昵称>   查指定的人
-    /今天            查看麦麦今天的日程
+    /今天            查看当前群/私聊今天的日程（展示名见 bot_name）
     /ss_set <QQ> <affinity|mood|ignore|thread> <值>   仅操作员（operator）
     /关系帮助
 
@@ -215,6 +216,7 @@ class DailyLifeSectionConfig(PluginConfigBase):
     enabled: bool = Field(default=True, description="每天自动生成麦麦的日程，回复时注入\"你现在大概在做 XX\"，问\"在干嘛\"能答出正在干嘛", json_schema_extra={"label": "生活日程开关"})
     model_task: str = Field(default="utils", description="生成日程用的 LLM 任务名", json_schema_extra={"label": "LLM 任务名"})
     persona: str = Field(default="", description="麦麦的人设简介（身份/年龄/喜好，如：大学生，喜欢游戏和动漫，有点毒舌）。日程会严格按这个人设生成，建议填写", json_schema_extra={"label": "人设简介（强烈建议填写）"})
+    bot_name: str = Field(default="麦麦", description="日程与 /今天 里展示用的名字，替代写死的「麦麦」", json_schema_extra={"label": "展示名"})
     wake_hour: int = Field(default=8, description="麦麦几点起床（起床前被叫=睡眼惺忪）", json_schema_extra={"label": "起床时间（点）", "min": 5, "max": 12})
     sleep_hour: int = Field(default=23, description="麦麦几点睡觉（之后被叫=在被窝里迷迷糊糊）", json_schema_extra={"label": "睡觉时间（点）", "min": 21, "max": 28})
     expression_style: bool = Field(default=True, description="表达约束：口语化短句、不写小说体、不知道的事不编造", json_schema_extra={"label": "表达约束注入"})
@@ -349,12 +351,36 @@ class SocialStateStore:
                 """
                 CREATE TABLE IF NOT EXISTS daily_schedule (
                     date    TEXT NOT NULL,
+                    scope   TEXT NOT NULL DEFAULT '',
                     period  TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    PRIMARY KEY (date, period)
+                    PRIMARY KEY (date, scope, period)
                 )
                 """
             )
+            # 旧库没有 scope：整表换成 (date, scope, period)。历史行 scope 留空，不猜测属于哪个会话。
+            try:
+                cols = {r[1] for r in self._conn.execute("PRAGMA table_info(daily_schedule)").fetchall()}
+                if "scope" not in cols:
+                    self._conn.execute(
+                        """
+                        CREATE TABLE daily_schedule_v2 (
+                            date    TEXT NOT NULL,
+                            scope   TEXT NOT NULL DEFAULT '',
+                            period  TEXT NOT NULL,
+                            content TEXT NOT NULL,
+                            PRIMARY KEY (date, scope, period)
+                        )
+                        """
+                    )
+                    self._conn.execute(
+                        "INSERT INTO daily_schedule_v2(date, scope, period, content) "
+                        "SELECT date, '', period, content FROM daily_schedule"
+                    )
+                    self._conn.execute("DROP TABLE daily_schedule")
+                    self._conn.execute("ALTER TABLE daily_schedule_v2 RENAME TO daily_schedule")
+            except Exception:
+                pass
             # v0.4.1：person→session 映射持久化（重启后主动中枢立即可用，无需等新消息重建）
             try:
                 self._conn.execute("ALTER TABLE person_state ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
@@ -567,41 +593,45 @@ class SocialStateStore:
 
     # ── v0.3：当日日程 ──
 
-    def get_schedule(self, date: str) -> List[Dict[str, str]]:
-        """取某天的日程（按时段排序），无则空列表。"""
+    def get_schedule(self, date: str, scope: str = "p") -> List[Dict[str, str]]:
+        """取某天某范围的日程。scope: 'p' 私聊 / 'g:群号'；'' 只用于迁移来的旧全局行。"""
+        scope = str(scope or "")
         with self._lock:
             cur = self._conn.execute(
-                "SELECT period, content FROM daily_schedule WHERE date=? ORDER BY period ASC",
-                (date,),
+                "SELECT period, content FROM daily_schedule WHERE date=? AND scope=? ORDER BY period ASC",
+                (date, scope),
             )
             return [{"period": r["period"], "content": r["content"]} for r in cur.fetchall()]
 
-    def get_recent_schedule_contents(self, before_date: str, days: int = 3) -> List[str]:
-        """取某天之前 N 天的日程内容（防重复用），返回 ["日期 内容", ...]。"""
+    def get_recent_schedule_contents(self, before_date: str, days: int = 3, scope: str = "p") -> List[str]:
+        """取同 scope 下某天之前 N 天的日程内容（防重复用），返回 ["日期 内容", ...]。"""
         out: List[str] = []
+        scope = str(scope or "")
         with self._lock:
             cur = self._conn.execute(
-                "SELECT date, content FROM daily_schedule WHERE date < ? ORDER BY date DESC, period ASC LIMIT ?",
-                (before_date, max(1, int(days)) * 8),
+                "SELECT date, content FROM daily_schedule WHERE date < ? AND scope=? "
+                "ORDER BY date DESC, period ASC LIMIT ?",
+                (before_date, scope, max(1, int(days)) * 8),
             )
             for r in cur.fetchall():
                 out.append(f"{r['date']} {r['content']}")
         return out
 
-    def save_schedule(self, date: str, items: List[Dict[str, str]]) -> int:
-        """覆盖写入某天的日程，返回条数。items: [{period, content}]"""
+    def save_schedule(self, date: str, items: List[Dict[str, str]], scope: str = "p") -> int:
+        """覆盖写入某天某范围的日程，返回条数。items: [{period, content}]"""
+        scope = str(scope or "")
         clean = []
         for it in items or []:
             p = str((it or {}).get("period") or "").strip()
             c = str((it or {}).get("content") or "").strip()
             if p and c:
-                clean.append((date, p[:32], c[:120]))
+                clean.append((date, scope, p[:32], c[:120]))
         if not clean:
             return 0
         with self._lock, self._conn:
-            self._conn.execute("DELETE FROM daily_schedule WHERE date=?", (date,))
+            self._conn.execute("DELETE FROM daily_schedule WHERE date=? AND scope=?", (date, scope))
             self._conn.executemany(
-                "INSERT OR REPLACE INTO daily_schedule (date, period, content) VALUES (?,?,?)",
+                "INSERT OR REPLACE INTO daily_schedule (date, scope, period, content) VALUES (?,?,?,?)",
                 clean,
             )
         return len(clean)
@@ -1474,16 +1504,86 @@ class DailyLife:
 
     def __init__(self, plugin: "SocialStatePlugin") -> None:
         self._p = plugin
-        self._generating: set = set()  # 正在生成的日期，防重入
+        self._generating: set = set()  # 正在生成的 date|scope，防重入
         # session_id → 上一次注入给这个会话的活动文本。同一会话里"你现在在做什么"只在
         # 第一次讲清，之后同一活动再注入会变成口头禅（麦麦老是重复自己在干嘛）。
         self._last_act: "OrderedDict[str, str]" = OrderedDict()
+        self._session_scope: "OrderedDict[str, str]" = OrderedDict()
 
     def _cfg(self) -> DailyLifeSectionConfig:
         return getattr(self._p.config, "daily_life", DailyLifeSectionConfig())
 
     def _ready(self) -> bool:
         return self._p._enabled() and bool(getattr(self._cfg(), "enabled", True)) and self._p._store is not None
+
+    def _bot_name(self) -> str:
+        name = str(getattr(self._cfg(), "bot_name", "") or "").strip()
+        return name or "麦麦"
+
+    @staticmethod
+    def scope_from_group(group_id: str = "", *, private: bool = False) -> str:
+        """私聊共用 p；每个群用 g:<group_id>。空群号且未标明私聊时不当成某个群。"""
+        gid = str(group_id or "").strip()
+        if private or not gid:
+            return "p"
+        return f"g:{gid}"
+
+    def remember_scope(self, session_id: str, scope: str) -> None:
+        if not session_id or not scope:
+            return
+        self._session_scope[session_id] = scope
+        self._session_scope.move_to_end(session_id)
+        while len(self._session_scope) > MAX_GROUP_SESSIONS:
+            self._session_scope.popitem(last=False)
+
+    def scope_for_session(self, session_id: str, group_id: str = "") -> str:
+        """当前会话的日程范围。显式 group_id 优先，其次本进程记过的映射，最后才查主库会话表。"""
+        gid = str(group_id or "").strip()
+        if gid:
+            scope = self.scope_from_group(gid)
+            self.remember_scope(session_id, scope)
+            return scope
+        if session_id:
+            hit = self._session_scope.get(session_id)
+            if hit:
+                return hit
+        scope = self._scope_from_host_db(session_id) if session_id else "p"
+        if session_id:
+            self.remember_scope(session_id, scope)
+        return scope
+
+    def _scope_from_host_db(self, session_id: str) -> str:
+        """重启后内存映射还没重建时，用主库 chat_sessions.group_id 判断群还是私聊。只读，失败当私聊。"""
+        db = self._maibot_db_path()
+        if not db:
+            return "p"
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            row = con.execute(
+                "SELECT group_id FROM chat_sessions WHERE session_id=? "
+                "ORDER BY last_active_timestamp DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            con.close()
+            return self.scope_from_group(str(row[0])) if row and row[0] else "p"
+        except Exception:
+            return "p"
+
+    def _maibot_db_path(self) -> Optional[str]:
+        here = os.path.abspath(__file__)
+        root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+        cands = (
+            "/MaiMBot/data/MaiBot.db",
+            os.path.join(root, "MaiBot.db"),
+            os.path.join(root, "data", "MaiBot.db"),
+        )
+        for c in cands:
+            try:
+                if c and os.path.isfile(c):
+                    return c
+            except Exception:
+                continue
+        return None
 
     # ── 当前状态（纯函数为主，可测试） ──
 
@@ -1515,7 +1615,7 @@ class DailyLife:
                 best = str(it.get("content") or "")
         return best
 
-    def life_block(self, session_id: str = "", is_new_turn: bool = True) -> str:
+    def life_block(self, session_id: str = "", is_new_turn: bool = True, group_id: str = "") -> str:
         """组装【表达约束】+【你今天的生活】注入段；不启用/没数据时返回空串。
 
         session_id 用于跨轮去重：同一会话内"你现在在做什么"只讲清楚一次，之后同一活动
@@ -1539,9 +1639,10 @@ class DailyLife:
         date = time.strftime("%Y-%m-%d", local)
         store = self._p._store
         assert store is not None
-        items = store.get_schedule(date)
+        scope = self.scope_for_session(session_id, group_id)
+        items = store.get_schedule(date, scope)
         if not items:
-            self._ensure_generate(date)
+            self._ensure_generate(date, scope)
             return "\n".join(parts)
         night = self.night_state(hour)
         if night is not None:
@@ -1573,21 +1674,25 @@ class DailyLife:
                 self._last_act.popitem(last=False)
         return line
 
-    def _ensure_generate(self, date: str) -> None:
-        if date in self._generating:
+    def _ensure_generate(self, date: str, scope: str = "p") -> None:
+        scope = str(scope or "p")
+        key = f"{date}|{scope}"
+        if key in self._generating:
             return
-        self._generating.add(date)
-        asyncio.create_task(self._generate_today(date))
+        self._generating.add(key)
+        asyncio.create_task(self._generate_today(date, scope))
 
     # ── 生成 ──
 
     def _build_generate_prompt(self, date: str, weekday: str, wake: int, sleep: int, persona: str,
-                              twist: str = "", recent_lines: Optional[List[str]] = None) -> str:
+                              twist: str = "", recent_lines: Optional[List[str]] = None,
+                              bot_name: str = "麦麦") -> str:
+        name = (bot_name or "麦麦").strip() or "麦麦"
         who = persona.strip()
         persona_line = (
-            f"你是\"麦麦\"（{who}）。日程活动必须符合这个人设的身份、年龄和生活习惯，不要出戏。"
+            f"你是\"{name}\"（{who}）。日程活动必须符合这个人设的身份、年龄和生活习惯，不要出戏。"
             if who
-            else "你是\"麦麦\"，一个普通的年轻人。"
+            else f"你是\"{name}\"，一个普通的年轻人。"
         )
         end_hour = min(sleep, 24)
         lines = [
@@ -1602,15 +1707,17 @@ class DailyLife:
                 + "\n".join(f"- {ln}" for ln in recent_lines)
             )
         lines.append(
-            f"请给麦麦安排今天 {wake:02d}:00-{end_hour:02d}:00 的日常：4-6 个时段，每个时段一句口语化的描述"
+            f"请给{name}安排今天 {wake:02d}:00-{end_hour:02d}:00 的日常：4-6 个时段，每个时段一句口语化的描述"
             "（像真实年轻人的日常：吃饭、上课/上班、摸鱼、打游戏、看动漫、刷手机、午睡、点外卖、追更……"
             "可以有具体细节但别浮夸）。"
         )
         lines.append("只输出 JSON 数组：[{\"period\":\"08:00-10:00\",\"content\":\"...\"},...]")
         return "\n".join(lines)
 
-    async def _generate_today(self, date: str) -> None:
+    async def _generate_today(self, date: str, scope: str = "p") -> None:
         store = self._p._store
+        scope = str(scope or "p")
+        gen_key = f"{date}|{scope}"
         try:
             cfg = self._cfg()
             local = time.localtime()
@@ -1624,9 +1731,10 @@ class DailyLife:
             # 随机基调按真人节奏低频出现：约 30% 的天有特殊状态，其余就是平常的一天。
             # 真人生活 = 高频重复 + 偶尔意外，每天都来一个"今日主题"反而假。
             twist = random.choice(DAY_TWISTS) if random.random() < 0.3 else ""
-            recent = store.get_recent_schedule_contents(date, 3)
+            recent = store.get_recent_schedule_contents(date, 3, scope)
             prompt = self._build_generate_prompt(
-                date, weekday, wake, sleep, str(getattr(cfg, "persona", "") or ""), twist, recent
+                date, weekday, wake, sleep, str(getattr(cfg, "persona", "") or ""), twist, recent,
+                self._bot_name(),
             )
             resp = await self._p.ctx.llm.generate(
                 prompt,
@@ -1637,23 +1745,23 @@ class DailyLife:
             start = text.find("[")
             end = text.rfind("]")
             if start < 0 or end <= start:
-                self._log("[生活日程] %s 生成失败：LLM 输出无法解析", date)
+                self._log("[生活日程] %s scope=%s 生成失败：LLM 输出无法解析", date, scope)
                 return
             try:
                 raw = json.loads(text[start : end + 1])
             except Exception:
-                self._log("[生活日程] %s 生成失败：JSON 解析失败", date)
+                self._log("[生活日程] %s scope=%s 生成失败：JSON 解析失败", date, scope)
                 return
             items = [it for it in raw if isinstance(it, dict)] if isinstance(raw, list) else []
-            n = store.save_schedule(date, items) if store else 0
+            n = store.save_schedule(date, items, scope) if store else 0
             if n:
-                self._log("[生活日程] %s 日程已生成（%d 个时段）", date, n)
+                self._log("[生活日程] %s scope=%s 日程已生成（%d 个时段）", date, scope, n)
             else:
-                self._log("[生活日程] %s 生成结果为空", date)
+                self._log("[生活日程] %s scope=%s 生成结果为空", date, scope)
         except Exception as exc:
             self._log("[生活日程] 生成异常: %s", exc)
         finally:
-            self._generating.discard(date)
+            self._generating.discard(gen_key)
 
     def _log(self, fmt: str, *args: Any) -> None:
         try:
@@ -2104,6 +2212,7 @@ class SocialStatePlugin(MaiBotPlugin):
             ts = time.time()
 
             if is_private:
+                self._life.remember_scope(session_id, self._life.scope_from_group(private=True))
                 self._remember_private(session_id, person_id)
                 self._store.touch_message(
                     person_id=person_id, platform=platform, user_id=user_id, display_name=display_name, ts=ts
@@ -2112,12 +2221,13 @@ class SocialStatePlugin(MaiBotPlugin):
                 # 喂感知器：攒消息、按间隔触发 LLM 评估（内部自行频控/防重入）
                 self._perceiver.feed_private(session_id, person_id, display_name, text_from_message(message), ts)
             else:
+                group_id = str((group_info or {}).get("group_id") or "")
+                self._life.remember_scope(session_id, self._life.scope_from_group(group_id))
                 self._remember_group(session_id, person_id)
                 if getattr(self.config.behavior, "track_group", True):
                     self._store.touch_message(
                         person_id=person_id, platform=platform, user_id=user_id, display_name=display_name, ts=ts
                     )
-                    group_id = str(group_info.get("group_id") or "")
                     self._store.add_event(person_id, "msg_group", group_id)
                     self._perceiver.feed_group(session_id, person_id, display_name, text_from_message(message), ts)
 
@@ -2191,7 +2301,12 @@ class SocialStatePlugin(MaiBotPlugin):
                     block = self._build_group_block(rows[: max(1, max_n)])
 
             # 阶段3a：表达约束 + 今日生活（独立于关系块，即使没有关系数据也注入）
-            life = self._life.life_block(session_id, is_new_turn=self._is_new_turn(kwargs))
+            # 只注入当前群或私聊自己的日程，不借用别的会话。
+            life = self._life.life_block(
+                session_id,
+                is_new_turn=self._is_new_turn(kwargs),
+                group_id=str(kwargs.get("group_id") or ""),
+            )
             if life:
                 block = (block + "\n" + life) if block else life
 
@@ -2380,16 +2495,20 @@ class SocialStatePlugin(MaiBotPlugin):
             else:
                 date = time.strftime("%Y-%m-%d")
                 assert self._store is not None
-                items = self._store.get_schedule(date)
+                group_id = str(kwargs.get("group_id") or "").strip()
+                scope = self._life.scope_from_group(group_id, private=not group_id)
+                self._life.remember_scope(stream_id, scope)
+                name = self._life._bot_name()
+                items = self._store.get_schedule(date, scope)
                 if not items:
-                    self._life._ensure_generate(date)
+                    self._life._ensure_generate(date, scope)
                     text = "今天的日程还在排，稍等几分钟再 /今天 看看"
                 else:
                     dcfg = getattr(self.config, "daily_life", None)
                     wake = int(clamp(getattr(dcfg, "wake_hour", 8), 5, 12))
                     sleep = int(clamp(getattr(dcfg, "sleep_hour", 23), 21, 28))
                     bed = sleep if sleep <= 24 else sleep - 24
-                    lines = [f"📅 麦麦今天（{date}）的日程："]
+                    lines = [f"📅 {name}今天（{date}）的日程："]
                     for it in items:
                         lines.append(f"  {it['period']}  {it['content']}")
                     hour_now = time.localtime().tm_hour
@@ -2410,7 +2529,7 @@ class SocialStatePlugin(MaiBotPlugin):
             "命令：\n"
             "  /关系 —— 私聊查自己；群里看本群最近互动 top5（隐私模式：昵称+QQ尾号）\n"
             "  /关系 <QQ号或昵称> —— 查指定的人（仅操作员，由主程序鉴权；群里想查自己的详细账本请私聊麦麦发 /关系）\n"
-            "  /今天 —— 看麦麦今天的日程\n"
+            f"  /今天 —— 看{self._life._bot_name()}今天的日程（只看当前群或私聊）\n"
             "  /ss_set <QQ号> <字段> <值> —— 手动调账（仅操作员）\n"
             "     字段：affinity 好感(-100~100)｜mood 心情(-50~50)｜ignore 冷落(0~100)｜thread 线头\n"
             "     例：/ss_set 123456 affinity 30 ；/ss_set 123456 thread 周末约了漫展\n"
@@ -2418,7 +2537,7 @@ class SocialStatePlugin(MaiBotPlugin):
             "说明：操作员在 bot_config.toml 的 [plugin].permission 里配 platform:user_id（如 qq:123456），\n"
             "本地控制台天然是操作员。好感/心情由感知器自动打分（LLM 语境化评估），\n"
             "也可用 /ss_set 手动校准。心情隔天自动归零，冷落指数每天缓解，线头默认 10 天有效。\n"
-            "麦麦每天有自己的日程（问\"在干嘛\"能答出正在干嘛），数据在 data/plugins/<插件ID>/ 下。"
+            f"{self._life._bot_name()}每天有自己的日程（按当前群或私聊分开；问\"在干嘛\"能答出正在干嘛），数据在 data/plugins/<插件ID>/ 下。"
         )
         await self.ctx.send.text(text, stream_id)
         return True, "ok", True
